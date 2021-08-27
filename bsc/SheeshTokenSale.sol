@@ -212,6 +212,9 @@ contract TimedCrowdsale {
 
   // Amount of wei raised
   uint256 public weiRaised;
+  
+  // usdt / bnb price feed
+  AggregatorV3Interface internal priceFeed;
 
   /**
    * Event for token purchase logging
@@ -238,6 +241,9 @@ contract TimedCrowdsale {
 
   /**
    * @dev Constructor, takes crowdsale opening and closing times.
+   * @param _rate Number of token units a buyer gets per wei
+   * @param _wallet Address where collected funds will be forwarded to
+   * @param _token Address of the token being sold
    * @param _openingTime Crowdsale opening time
    * @param _closingTime Crowdsale closing time
    */
@@ -255,6 +261,7 @@ contract TimedCrowdsale {
     token = _token;
     openingTime = _openingTime;
     closingTime = _closingTime;
+    priceFeed = AggregatorV3Interface(0x2514895c72f50D8bd4B4F9b1110F0D6bD2c97526);
   }
 
   /**
@@ -296,6 +303,20 @@ contract TimedCrowdsale {
   receive () external payable {
       buyTokens(msg.sender);
   }
+  
+  /**
+     * Returns the latest price
+     */
+    function getLatestPrice() public view returns (int) {
+        (
+            uint80 roundID, 
+            int price,
+            uint startedAt,
+            uint timeStamp,
+            uint80 answeredInRound
+        ) = priceFeed.latestRoundData();
+        return price;
+    }
 
   /**
    * @dev low level token purchase ***DO NOT OVERRIDE***
@@ -390,6 +411,8 @@ contract TimedCrowdsale {
   function _getTokenAmount(uint256 _weiAmount)
     internal view returns (uint256)
   {
+    int _rate = getLatestPrice();
+    //rate = 10**2 * _rate;
     return _weiAmount.mul(rate);
   }
 
