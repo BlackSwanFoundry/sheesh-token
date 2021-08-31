@@ -138,7 +138,7 @@ library SafeMath {
   }
 }
 
-interface AggregatorV3Interface {
+interface IAggregatorV3 {
 
   function decimals()
     external
@@ -191,32 +191,137 @@ interface AggregatorV3Interface {
 }
 
 /**
+ * @dev Provides information about the current execution context, including the
+ * sender of the transaction and its data. While these are generally available
+ * via msg.sender and msg.data, they should not be accessed in such a direct
+ * manner, since when dealing with meta-transactions the account sending and
+ * paying for execution may not be the actual sender (as far as an application
+ * is concerned).
+ *
+ * This contract is only required for intermediate, library-like contracts.
+ */
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+}
+
+/**
+ * @dev Contract module which provides a basic access control mechanism, where
+ * there is an account (an owner) that can be granted exclusive access to
+ * specific functions.
+ *
+ * By default, the owner account will be the one that deploys the contract. This
+ * can later be changed with {transferOwnership}.
+ *
+ * This module is used through inheritance. It will make available the modifier
+ * `onlyOwner`, which can be applied to your functions to restrict their use to
+ * the owner.
+ */
+abstract contract Ownable is Context {
+    address private _owner;
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    /**
+     * @dev Initializes the contract setting the deployer as the initial owner.
+     */
+    constructor() {
+        _setOwner(_msgSender());
+    }
+
+    /**
+     * @dev Returns the address of the current owner.
+     */
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @dev Throws if called by any account other than the owner.
+     */
+    modifier onlyOwner() {
+        require(owner() == _msgSender(), "Ownable: caller is not the owner");
+        _;
+    }
+
+    /**
+     * @dev Leaves the contract without owner. It will not be possible to call
+     * `onlyOwner` functions anymore. Can only be called by the current owner.
+     *
+     * NOTE: Renouncing ownership will leave the contract without an owner,
+     * thereby removing any functionality that is only available to the owner.
+     */
+    function renounceOwnership() public virtual onlyOwner {
+        _setOwner(address(0));
+    }
+
+    /**
+     * @dev Transfers ownership of the contract to a new account (`newOwner`).
+     * Can only be called by the current owner.
+     */
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        require(newOwner != address(0), "Ownable: new owner is the zero address");
+        _setOwner(newOwner);
+    }
+
+    function _setOwner(address newOwner) private {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+/**
  * @title TimedCrowdsale
  * @dev Crowdsale accepting contributions only within a time frame.
  */
-contract TimedCrowdsale {
+contract TimedCrowdsale is Ownable {
   using SafeMath for uint256;
-
-  uint256 public openingTime;
-  uint256 public closingTime;
   
-    // The token being sold
-  IBEP20 public token;
-
-  // Address where funds are collected
-  address public wallet;
-
-  // How many token units a buyer gets per wei
-  uint256 public rate;
-
-  // Amount of wei raised
-  uint256 public weiRaised;
+  struct Session {
+      // UID
+      uint256 id;
+      // Timestamp the sale starts
+      uint256 start;
+      // Timestamp the sale stops
+      uint256 stop;
+      // Last rate sync timestamp
+      uint256 sync;
+      // Current Rate
+      uint256 rate;
+      // Rate normalization: rate / 10**{decimal}
+      uint8 decimal;
+      // Current TOKEN|BNB Rate
+      uint256 issue;
+      // WEI raised
+      uint256 raised;
+      // Maximum sale quantity
+      uint256 max;
+      // Total tokens sold
+      uint256 sold;
+      // Total minutes before bnb rate update
+      uint256 threshold;
+      // Contract address of chainlink aggregator
+      address chainlink;
+      // Token Sale Owner
+      address owner;
+      // Token Contract
+      IBEP20 token;
+  }
   
-  // Last price sync timestamp
-  uint256 public rateSync;
-  
-  // usdt / bnb price feed
-  AggregatorV3Interface internal priceFeed;
+  // The token sale sessions
+  mapping(uint256 => Session) public sessions;
+  // The uid seed.
+  uint256 uid;
+  // The emergency kill-switch
+  bool kill;
+  // The aggregator utilized for dynamic rates.
+  IAggregatorV3 internal rates;
 
   /**
    * Event for token purchase logging
@@ -231,60 +336,76 @@ contract TimedCrowdsale {
     uint256 value,
     uint256 amount
   );
-
+  
+  event SessionScheduled(
+      address indexed creator,
+      uint256 id
+  );
+  
   /**
-   * @dev Reverts if not in crowdsale time range.
+   * @dev Reverts if sale id not open.
    */
-  modifier onlyWhileOpen {
-    // solium-disable-next-line security/no-block-members
-    require(block.timestamp >= openingTime && block.timestamp <= closingTime);
-    _;
+  modifier open(uint256 _id) {
+      // solium-disable-next-line security/no-block-members
+      require(block.timestamp >= sessions[_id].start && block.timestamp <= sessions[_id].stop);
+      _;
   }
 
   /**
    * @dev Constructor, takes crowdsale opening and closing times.
-   * @param _wallet Address where collected funds will be forwarded to
-   * @param _token Address of the token being sold
-   * @param _openingTime Crowdsale opening time
-   * @param _closingTime Crowdsale closing time
    */
-  constructor(address _wallet, IBEP20 _token, uint256 _openingTime, uint256 _closingTime) {
-    require(_wallet != address(0));
-    require(address(_token) != address(0));
-    // solium-disable-next-line security/no-block-members
-    require(_openingTime >= block.timestamp);
-    require(_closingTime >= _openingTime);
+  constructor() {
+      uid = 0;
+  }
+  
+  function create(uint256 _start,uint256 _stop,uint256 _rate, uint8 _decimal,uint256 _issue,uint256 _max,uint256 _threshold,address _chainlink,address _token) public returns(uint256) {
+      require(address(_token) != address(0));
+      // solium-disable-next-line security/no-block-members
+      require(_start >= block.timestamp);
+      require(_stop > _start);
+      require(_rate >= 0 || _chainlink != address(0));
+      
+      uint256 _id = _getId();
+      // TODO: Check for existing contract for token, ensure no date collisions.
+      
+      Session memory sesh = Session({
+          id: _id,
+          start: _start,
+          stop: _stop,
+          sync: uint256(0),
+          rate: _rate,
+          decimal: _decimal,
+          issue: _issue,
+          max: _max,
+          sold: uint256(0),
+          raised: uint256(0),
+          threshold: _threshold,
+          chainlink: _chainlink,
+          owner: msg.sender,
+          token: IBEP20(_token)
+      });
 
-    wallet = _wallet;
-    token = _token;
-    openingTime = _openingTime;
-    closingTime = _closingTime;
-    priceFeed = AggregatorV3Interface(0x2514895c72f50D8bd4B4F9b1110F0D6bD2c97526);
-    rate = _getLatestPrice();
-    rateSync = block.timestamp;
+      sessions[_id] = sesh;
+      emit SessionScheduled(msg.sender,_id);
+      return _id;
   }
 
   /**
    * @dev Checks whether the period in which the crowdsale is open has already elapsed.
+   * @param _id the token sale uid
    * @return Whether crowdsale period has elapsed
    */
-  function hasClosed() public view returns (bool) {
-    // solium-disable-next-line security/no-block-members
-    return block.timestamp > closingTime;
+  function hasClosed(uint256 _id) public view returns(bool){
+      return block.timestamp > sessions[_id].stop;
   }
 
   /**
    * @dev Extend parent behavior requiring to be within contributing period
+   * @param _id sale id
    * @param _beneficiary Token purchaser
    * @param _weiAmount Amount of wei contributed
    */
-  function _preValidatePurchase (
-    address _beneficiary,
-    uint256 _weiAmount
-  ) internal
-    view
-    onlyWhileOpen
-  {
+  function _preValidatePurchase (uint256 _id,address _beneficiary,uint256 _weiAmount) internal view open(_id) {
     require(_beneficiary != address(0));
     require(_weiAmount != 0);
   }
@@ -297,43 +418,44 @@ contract TimedCrowdsale {
    * @dev fallback function ***DO NOT OVERRIDE***
    */
   fallback () external  payable {
-    buyTokens(msg.sender);
+    _forwardFunds();
   }
   
   receive () external payable {
-      buyTokens(msg.sender);
+      _forwardFunds();
   }
   
-    /**
-     * Returns the latest price BNB price in usd
-     */
-    function _getLatestPrice() private view returns (uint256) {
-        (
-            uint80 roundID, 
-            int price,
-            uint startedAt,
-            uint timeStamp,
-            uint80 answeredInRound
-        ) = priceFeed.latestRoundData();
-        return uint256(price).div(10**8);
-    }
+  function _getId() private returns(uint256){
+      return uid += 1;
+  }
+   
+  /**
+   * Returns the latest rate price.
+   * @param {address} _chainlink  aggregator contract address.
+   * @param {int8}  _decimal integer to normalize to a desired fiat increment
+   */
+   function _getLatestPrice(address _chainlink, uint8 _decimal) private returns(uint){
+       rates = IAggregatorV3(_chainlink);
+       (,int price,,,) = rates.latestRoundData(); 
+       return (uint(price) / 10**_decimal);
+   }
 
   /**
    * @dev low level token purchase ***DO NOT OVERRIDE***
    * @param _beneficiary Address performing the token purchase
    */
-  function buyTokens(address _beneficiary) public payable {
+  function buyTokens(uint256 _id, address _beneficiary) public payable open(_id) {
 
     uint256 weiAmount = msg.value;
-    _preValidatePurchase(_beneficiary, weiAmount);
+    _preValidatePurchase(_id,_beneficiary, weiAmount);
 
     // calculate token amount to be created
-    uint256 tokens = _getTokenAmount(weiAmount);
+    uint256 tokens = _getTokenAmount(_id,weiAmount);
 
     // update state
-    weiRaised = weiRaised.add(weiAmount);
+    sessions[_id].raised = sessions[_id].raised.add(weiAmount);
 
-    _processPurchase(_beneficiary, tokens);
+    _processPurchase(_id,_beneficiary, tokens);
     emit TokenPurchase(
       msg.sender,
       _beneficiary,
@@ -341,10 +463,8 @@ contract TimedCrowdsale {
       tokens
     );
 
-    _updatePurchasingState(_beneficiary, weiAmount);
-
-    _forwardFunds();
-    _postValidatePurchase(_beneficiary, weiAmount);
+    _forwardFunds(_id);
+    _postValidatePurchase(_id,_beneficiary, weiAmount);
   }
 
   /**
@@ -353,12 +473,14 @@ contract TimedCrowdsale {
    * @param _weiAmount Value in wei involved in the purchase
    */
   function _postValidatePurchase(
+    uint256 _id,
     address _beneficiary,
     uint256 _weiAmount
   )
     internal
   {
     // optional override
+    sessions[_id].raised = sessions[_id].raised.add(_weiAmount);
   }
 
   /**
@@ -367,12 +489,13 @@ contract TimedCrowdsale {
    * @param _tokenAmount Number of tokens to be emitted
    */
   function _deliverTokens(
+    uint256 _id,
     address _beneficiary,
     uint256 _tokenAmount
   )
     internal
   {
-    token.transfer(_beneficiary, _tokenAmount);
+    sessions[_id].token.transfer(_beneficiary, _tokenAmount);
   }
 
   /**
@@ -381,53 +504,46 @@ contract TimedCrowdsale {
    * @param _tokenAmount Number of tokens to be purchased
    */
   function _processPurchase(
+    uint256 _id,
     address _beneficiary,
     uint256 _tokenAmount
   )
     internal
   {
-    _deliverTokens(_beneficiary, _tokenAmount);
-  }
-
-  /**
-   * @dev Override for extensions that require an internal state to check for validity (current user contributions, etc.)
-   * @param _beneficiary Address receiving the tokens
-   * @param _weiAmount Value in wei involved in the purchase
-   */
-  function _updatePurchasingState(
-    address _beneficiary,
-    uint256 _weiAmount
-  )
-    internal
-  {
-    // optional override
+    _deliverTokens(_id, _beneficiary, _tokenAmount);
   }
 
   /**
    * @dev Override to extend the way in which ether is converted to tokens.
+   * @param _id sale id
    * @param _weiAmount Value in wei to be converted into tokens
    * @return Number of tokens that can be purchased with the specified _weiAmount
    */
-  function _getTokenAmount(uint256 _weiAmount)
+  function _getTokenAmount(uint256 _id, uint256 _weiAmount)
     internal returns (uint256)
   {
-      if(rate > 0 && rateSync > 0){
-          if((block.timestamp - rateSync).div(1000).div(60) >= uint256(5)){
-              rate = _getLatestPrice();
-              rateSync = block.timestamp;
+      Session storage sesh = sessions[_id];
+      if(sesh.rate > 0 && sesh.sync > 0){
+          if((block.timestamp - sesh.sync).div(1000).div(60) >= sesh.threshold){
+              sesh.rate = _getLatestPrice(sesh.chainlink, sesh.decimal);
+              sesh.sync = block.timestamp;
           }
       }else{
-          rate = _getLatestPrice();
-          rateSync = block.timestamp;
+          sesh.rate = _getLatestPrice(sesh.chainlink, sesh.decimal);
+          sesh.sync = block.timestamp;
       }
-    return _weiAmount.div(10**18).mul(rate);
+    return _weiAmount.div(10**18).mul(sesh.rate);
   }
 
   /**
    * @dev Determines how ETH is stored/forwarded on purchases.
    */
-  function _forwardFunds() internal {
-    payable(wallet).transfer(msg.value);
+  function _forwardFunds(uint256 _id) internal {
+      // TODO: Take % Fee
+    payable(sessions[_id].owner).transfer(msg.value);
   }
-
+  
+  function _forwardFunds() internal {
+      payable(owner()).transfer(msg.value);
+  }
 }
